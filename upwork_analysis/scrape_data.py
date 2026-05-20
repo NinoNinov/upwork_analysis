@@ -183,7 +183,8 @@ def parse_total_spent(total_spent: str) -> int | None:
     return int(total_spent)
 
 
-def parse_one_job(driver: Chrome, job: Tag, index: int, fast: bool = False) -> dict[str, str | int | float | None]:
+def parse_one_job(driver: Chrome, job: Tag, index: int, fast: bool = False,
+                  known_job_ids: set[str] | None = None) -> dict[str, str | int | float | None]:
     """
     Parses one job listing (html) and returns a dictionary containing its information. The collected information is:
         - Job title
@@ -267,6 +268,14 @@ def parse_one_job(driver: Chrome, job: Tag, index: int, fast: bool = False) -> d
         "client_hire_rate", "client_hourly_rate", "client_total_spent")
     job_details.update({key: None for key in remaining_keys})  # Default as None because an error might occur.
 
+    # Skip the per-job detail navigation when the caller already has this job
+    # in their persistent store. This is the cheap path through the loop -- the
+    # card-level fields are still populated, so dedup downstream can drop the
+    # row without us having spent ~12s on driver.get(detail_url).
+    if known_job_ids and job_id and job_id in known_job_ids:
+        sleep(0.05, 0.15)  # tiny jitter -- no detail navigation happened
+        return job_details
+
     # Tier 3 Step A: navigate to the actual detail page URL instead of clicking the
     # tile to open a slide-in panel. This eliminates the panel race condition where
     # `wait_for_selector` returned a stale element from the previous job's panel.
@@ -319,7 +328,8 @@ class JobsScraper:
             retries: int = 3,
             headless: bool = False,
             workers: int = 1,
-            fast: bool = False) -> None:
+            fast: bool = False,
+            known_job_ids: set[str] | None = None) -> None:
         """
         Scrapes the `jobs_per_page` * `pages_to_scrape` jobs resulting from searching for `search_query`.
 
@@ -370,6 +380,10 @@ class JobsScraper:
         self.headless = headless
         self.workers = workers
         self.fast = fast
+        # When provided, parse_one_job skips the expensive driver.get(detail_url)
+        # for any job whose id is already in this set. The card-level fields are
+        # still parsed and returned so the downstream dedup can drop the row.
+        self.known_job_ids: set[str] = known_job_ids or set()
 
         self.link_get_took = 0.
         total_npages = self.get_total_number_of_result_pages()
@@ -528,7 +542,7 @@ class JobsScraper:
             jobs = soup.find_all('article')
             self.pages_to_jobs[action][page] = []
             for i, job in enumerate(jobs):
-                job = parse_one_job(driver, job, i + 1, self.fast)
+                job = parse_one_job(driver, job, i + 1, self.fast, self.known_job_ids)
                 description = job['description']
                 if description in self.seen_descriptions:
                     consecutive_seens += 1
