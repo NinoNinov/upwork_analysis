@@ -20,7 +20,7 @@ from bs4 import BeautifulSoup
 from bs4.element import Tag
 
 job_title_selector = ".air3-line-clamp > h2 > a"  # Text could be embedded in the anchor tag or set as text attribute.
-post_time_selector = ".job-tile-header div small span:nth-child(2)"
+post_time_selector = 'small[data-test="job-pubilshed-date"]'  # 2026-05-20: Upwork redesigned the search card; the text now reads "Posted X ago". The data-test attribute has the typo "pubilshed" — keep as-is.
 job_skills_selector = 'div[data-test="JobTileDetails"] div.air3-token-container span[data-test="token"] span'  # multi
 description_selector = "div.air3-line-clamp.is-clamped > p.mb-0"
 
@@ -37,7 +37,7 @@ client_location_selector = client_details_selector + ' > li:nth-child(1) > stron
 client_jobs_posted_selector = client_details_selector + ' > li[data-qa="client-job-posting-stats"] > strong'
 client_hire_rate_selector = client_details_selector + ' > li[data-qa="client-job-posting-stats"] > div'
 client_hourly_rate_selector = client_details_selector + ' strong[data-qa="client-hourly-rate"]'
-client_spent_selector = client_details_selector + ' strong[data-qa="client-spend"] > span'
+client_spent_selector = client_details_selector + ' strong[data-qa="client-spend"]'  # 2026-05-20: dropped " > span" — only one client template renders the value inside a span; the other puts it directly in the strong. The text format is "$1K total spent" — first whitespace token is the amount.
 
 job_back_arrow_selector = 'div.air3-slider-header > button.air3-slider-prev-btn.air3-slider-close-desktop > div'
 
@@ -238,8 +238,12 @@ def parse_one_job(driver: Chrome, job: Tag, index: int, fast: bool = False) -> d
     # --- Raw post-time text (kept alongside the parsed timestamp for diagnosability).
     # Some article placeholders (e.g. captcha interstitials, promoted/sponsored
     # rows) lack a post-time element; treat it as missing rather than crashing.
+    # 2026-05-20: Upwork now wraps it as "Posted X ago"; parse_time wants the
+    # bare "X ago" form, so strip the prefix before parsing while keeping the
+    # original verbatim in time_raw.
     post_time_el = job.select_one(post_time_selector)
-    raw_time = post_time_el.text if post_time_el else ""
+    raw_time = post_time_el.get_text(strip=True) if post_time_el else ""
+    parsable_time = raw_time.removeprefix("Posted ").strip() if raw_time else ""
 
     job_details = {
         "title": title_anchor.text if title_anchor else "",
@@ -247,7 +251,7 @@ def parse_one_job(driver: Chrome, job: Tag, index: int, fast: bool = False) -> d
         "job_id": job_id,
         "description": (job.select_one(description_selector).text
                         if job.select_one(description_selector) else ""),
-        "time": parse_time(raw_time) if raw_time else None,
+        "time": parse_time(parsable_time) if parsable_time else None,
         "time_raw": raw_time or None,
         "skills": [skill.text for skill in job.select(job_skills_selector)],
         "type": job_type.split(':')[0].split()[0],
