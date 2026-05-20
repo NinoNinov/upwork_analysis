@@ -8,6 +8,7 @@ import platform
 import random
 import ctypes
 import json
+import re
 import time
 
 from seleniumbase.common.exceptions import (
@@ -39,6 +40,20 @@ client_hourly_rate_selector = client_details_selector + ' strong[data-qa="client
 client_spent_selector = client_details_selector + ' strong[data-qa="client-spend"] > span'
 
 job_back_arrow_selector = 'div.air3-slider-header > button.air3-slider-prev-btn.air3-slider-close-desktop > div'
+
+# Card-level selectors (used BEFORE clicking through, so no panel race condition).
+# These read from the listing tile itself; multiple fallbacks because Upwork
+# uses different attribute combinations across template versions.
+card_country_selectors = (
+    '[data-test="client-country"]',
+    '[data-test="JobInfo-Country"]',
+    'li[data-test="location"] strong',
+    'li[data-test="client-location"]',
+    'div[data-test="LocationLabel"]',
+)
+
+# Regex to extract the Upwork job cipher (~01... or ~02...) from a URL.
+_JOB_ID_RE = re.compile(r"(~[0-9a-zA-Z]{10,})")
 
 
 def split_list_into_chunks(lst: list, num_chunks: int) -> list[list]:
@@ -221,10 +236,34 @@ def parse_one_job(driver: Chrome, job: Tag, index: int, fast: bool = False) -> d
     time_estimate = job.select_one(time_estimate_selector)
     budget = job.select_one(budget_selector)
 
+    # --- Title anchor: extract text, href (url) and the Upwork cipher (job_id).
+    title_anchor = job.select_one(job_title_selector)
+    raw_href = title_anchor.get("href", "") if title_anchor else ""
+    if raw_href and raw_href.startswith("/"):
+        url = "https://www.upwork.com" + raw_href
+    else:
+        url = raw_href
+    job_id_match = _JOB_ID_RE.search(url) if url else None
+    job_id = job_id_match.group(1) if job_id_match else None
+
+    # --- Raw post-time text (kept alongside the parsed timestamp for diagnosability).
+    raw_time = job.select_one(post_time_selector).text
+
+    # --- Card-level country (read BEFORE clicking, so no slide-in panel race).
+    card_location = None
+    for sel in card_country_selectors:
+        el = job.select_one(sel)
+        if el and el.text.strip():
+            card_location = el.text.strip()
+            break
+
     job_details = {
-        "title": job.select_one(job_title_selector).text,
+        "title": title_anchor.text if title_anchor else "",
+        "url": url or None,
+        "job_id": job_id,
         "description": job.select_one(description_selector).text,
-        "time": parse_time(job.select_one(post_time_selector).text),
+        "time": parse_time(raw_time),
+        "time_raw": raw_time,
         "skills": [skill.text for skill in job.select(job_skills_selector)],
         "type": job_type.split(':')[0].split()[0],
         "experience_level": xp_level.text if xp_level else None,
@@ -232,19 +271,31 @@ def parse_one_job(driver: Chrome, job: Tag, index: int, fast: bool = False) -> d
         "budget": parse_budget(job_type, budget.text if budget else None)
     }
     if fast:
+        # Card-level location is the only location signal available in fast mode.
+        job_details["client_location"] = card_location
         return job_details
 
     remaining_keys = (
         "proposals", "client_location", "client_jobs_posted",
         "client_hire_rate", "client_hourly_rate", "client_total_spent")
     job_details.update({key: None for key in remaining_keys})  # Default as None because an error might occur.
+    # Seed client_location with the card-level read so we still have a value even
+    # if the click-through panel times out or returns stale data.
+    if card_location:
+        job_details["client_location"] = card_location
 
     try:
         driver.execute_script("arguments[0].click();", driver.find_element(f"article:nth-child({index})"))
         driver.wait_for_selector(client_location_selector, timeout=1.5)
         job_soup = BeautifulSoup(driver.page_source, "html.parser")
         job_details["proposals"] = job_soup.select_one(proposals_selector).text
-        job_details["client_location"] = job_soup.select_one(client_location_selector).text
+        # Prefer card-level country over the panel value (panel is prone to a stale-data
+        # race when the previous panel hasn't fully closed). Only fall back to the panel
+        # if the card didn't yield a value at all.
+        if not card_location:
+            panel_location_el = job_soup.select_one(client_location_selector)
+            if panel_location_el:
+                job_details["client_location"] = panel_location_el.text
         for key, selector, parse_func in zip(
                 remaining_keys[2:],
                 (client_jobs_posted_selector, client_hire_rate_selector,
