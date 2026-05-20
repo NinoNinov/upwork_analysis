@@ -236,15 +236,19 @@ def parse_one_job(driver: Chrome, job: Tag, index: int, fast: bool = False) -> d
     job_id = job_id_match.group(1) if job_id_match else None
 
     # --- Raw post-time text (kept alongside the parsed timestamp for diagnosability).
-    raw_time = job.select_one(post_time_selector).text
+    # Some article placeholders (e.g. captcha interstitials, promoted/sponsored
+    # rows) lack a post-time element; treat it as missing rather than crashing.
+    post_time_el = job.select_one(post_time_selector)
+    raw_time = post_time_el.text if post_time_el else ""
 
     job_details = {
         "title": title_anchor.text if title_anchor else "",
         "url": url or None,
         "job_id": job_id,
-        "description": job.select_one(description_selector).text,
-        "time": parse_time(raw_time),
-        "time_raw": raw_time,
+        "description": (job.select_one(description_selector).text
+                        if job.select_one(description_selector) else ""),
+        "time": parse_time(raw_time) if raw_time else None,
+        "time_raw": raw_time or None,
         "skills": [skill.text for skill in job.select(job_skills_selector)],
         "type": job_type.split(':')[0].split()[0],
         "experience_level": xp_level.text if xp_level else None,
