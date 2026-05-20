@@ -263,29 +263,43 @@ def parse_one_job(driver: Chrome, job: Tag, index: int, fast: bool = False) -> d
         "client_hire_rate", "client_hourly_rate", "client_total_spent")
     job_details.update({key: None for key in remaining_keys})  # Default as None because an error might occur.
 
-    try:
-        driver.execute_script("arguments[0].click();", driver.find_element(f"article:nth-child({index})"))
-        driver.wait_for_selector(client_location_selector, timeout=1.5)
-        job_soup = BeautifulSoup(driver.page_source, "html.parser")
-        job_details["proposals"] = job_soup.select_one(proposals_selector).text
-        job_details["client_location"] = job_soup.select_one(client_location_selector).text
-        for key, selector, parse_func in zip(
-                remaining_keys[2:],
-                (client_jobs_posted_selector, client_hire_rate_selector,
-                 client_hourly_rate_selector, client_spent_selector),
-                (lambda e: int(e.replace(',', '')), lambda e: float(e[:-1]) / 100,
-                 lambda e: float(e[1:]), parse_total_spent)
-        ):
-            element = job_soup.select_one(selector)
-            job_details[key] = parse_func(element.text.split()[0]) if element else element
-    except (SBNoSuchElementException, NoSuchElementException):  # In case of a timeout or private job listing.
-        pass
-    try:
-        driver.wait_for_selector(job_back_arrow_selector, timeout=1.5)
-        driver.find_element(job_back_arrow_selector).click()
-    except (SBWebDriverException, WebDriverException):
-        pass
-    sleep()  # Wait for the animation to finish.
+    # Tier 3 Step A: navigate to the actual detail page URL instead of clicking the
+    # tile to open a slide-in panel. This eliminates the panel race condition where
+    # `wait_for_selector` returned a stale element from the previous job's panel.
+    # We rely on `job_details["url"]` being populated (captured in Tier 1 from the
+    # card title anchor) -- skip detail fetch if it's missing.
+    detail_url = job_details.get("url")
+    if detail_url:
+        search_url = driver.current_url
+        try:
+            driver.get(detail_url)
+            driver.wait_for_selector(client_location_selector, timeout=10)
+            job_soup = BeautifulSoup(driver.page_source, "html.parser")
+            proposals_el = job_soup.select_one(proposals_selector)
+            if proposals_el:
+                job_details["proposals"] = proposals_el.text
+            location_el = job_soup.select_one(client_location_selector)
+            if location_el:
+                job_details["client_location"] = location_el.text
+            for key, selector, parse_func in zip(
+                    remaining_keys[2:],
+                    (client_jobs_posted_selector, client_hire_rate_selector,
+                     client_hourly_rate_selector, client_spent_selector),
+                    (lambda e: int(e.replace(',', '')), lambda e: float(e[:-1]) / 100,
+                     lambda e: float(e[1:]), parse_total_spent)
+            ):
+                element = job_soup.select_one(selector)
+                job_details[key] = parse_func(element.text.split()[0]) if element else element
+        except (SBNoSuchElementException, NoSuchElementException, SBWebDriverException, WebDriverException):
+            pass  # Private listing / timeout / network -- leave fields as None.
+        finally:
+            # Return to the search results so the next article-index click resolves
+            # against the correct DOM.
+            try:
+                driver.get(search_url)
+            except (SBWebDriverException, WebDriverException):
+                pass
+    sleep(0.4, 0.8)  # Small jitter to look less bot-like between requests.
     return job_details
 
 
