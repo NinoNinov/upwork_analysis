@@ -137,8 +137,13 @@ def construct_url(query: str, jobs_per_page: int = 10, start_page: int = 1) -> s
             f"&sort=recency")
 
 
-def parse_time(relative_time: str) -> float:
-    """Upwork jobs post-dates are relative to the local time of the host, this function converts them as Unix time"""
+def parse_time(relative_time: str) -> float | None:
+    """Upwork jobs post-dates are relative to the local time of the host, this function converts them as Unix time.
+
+    Returns None on unparseable input so a single weirdly-phrased post date never
+    crashes the worker thread. 2026-05-21: added quarter/year coverage after
+    Upwork started using those units in some listings.
+    """
     relative_time = relative_time.lower()
     if relative_time == "yesterday":
         time_delta = timedelta(days=1)
@@ -147,12 +152,26 @@ def parse_time(relative_time: str) -> float:
     elif "last month" in relative_time:
         time_delta = timedelta(days=30)
     else:
-        number, unit = relative_time.split()[:2]
+        parts = relative_time.split()
+        if len(parts) < 2:
+            return None
+        number, unit = parts[:2]
         unit += 's' if not unit.endswith('s') else ''  # Turn minute to minutes, for example.
+        # Map non-timedelta-native units to days. timedelta only accepts
+        # days/seconds/microseconds/milliseconds/minutes/hours/weeks.
         if "month" in unit:
             number = int(number) * 30
             unit = "days"
-        time_delta = timedelta(**{unit: int(number)})
+        elif "quarter" in unit:
+            number = int(number) * 90
+            unit = "days"
+        elif "year" in unit:
+            number = int(number) * 365
+            unit = "days"
+        try:
+            time_delta = timedelta(**{unit: int(number)})
+        except (TypeError, ValueError):
+            return None
     absolute_time = datetime.now() - time_delta
     return int(absolute_time.timestamp())
 
@@ -547,8 +566,30 @@ class JobsScraper:
             soup = BeautifulSoup(driver.page_source, "html.parser")
             jobs = soup.find_all('article')
             self.pages_to_jobs[action][page] = []
+            session_dead = False
             for i, job in enumerate(jobs):
-                job = parse_one_job(driver, job, i + 1, self.fast, self.known_job_ids)
+                # 2026-05-21: per-job error containment. A single article
+                # blowing up (e.g. parse_time crash, transient selector miss,
+                # uc-Chrome session death) used to kill the whole worker
+                # thread, leaving us with 2/50 jobs. We now classify:
+                #   - session-death errors -> mark page failed + stop this
+                #     page (retry_failed will pick it up with a fresh driver);
+                #   - everything else      -> log + skip just this article.
+                try:
+                    job = parse_one_job(driver, job, i + 1, self.fast, self.known_job_ids)
+                except Exception as exc:
+                    cls_name = exc.__class__.__name__
+                    if cls_name in ('InvalidSessionIdException',
+                                    'NoSuchWindowException',
+                                    'SessionNotCreatedException'):
+                        time_print(f"Driver session lost on page {page} "
+                                   f"(job {i + 1}): {cls_name}. Will retry page.")
+                        self.failed_pages.add(page)
+                        session_dead = True
+                        break
+                    time_print(f"Skipping job {i + 1} on page {page} "
+                               f"({cls_name}): {str(exc)[:140]}")
+                    continue
                 description = job['description']
                 if description in self.seen_descriptions:
                     consecutive_seens += 1
@@ -562,9 +603,16 @@ class JobsScraper:
                 if consecutive_seens > 5:
                     self.seen_page = min(page, self.seen_page) if self.seen_page else page
                     break
+            if session_dead:
+                # Driver is gone; can't scrape more pages with it. Bail out of
+                # the page loop -- retry_failed() will spin up a fresh driver.
+                break
 
         inhibit_sleep(False)
-        driver.quit()
+        try:
+            driver.quit()
+        except Exception:
+            pass  # Driver already dead.
 
     def distribute_work(self, page_numbers: list, action: str = 'scrape') -> None:
         """Distributes the number of pages to scrape across `self.workers` threads. This function is blocking."""
