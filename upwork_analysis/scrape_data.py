@@ -10,6 +10,7 @@ import ctypes
 import json
 import re
 import time
+import urllib.parse
 
 from seleniumbase.common.exceptions import (
     NoSuchElementException as SBNoSuchElementException, WebDriverException as SBWebDriverException)
@@ -122,7 +123,12 @@ def construct_url(query: str, jobs_per_page: int = 10, start_page: int = 1) -> s
     # Only 10, 20 and 50 are valid values to jobs_per_page; this expression takes care of getting the closest allowed
     # number to the input.
     jobs_per_page = min([10, 20, 50], key=lambda x: abs(x - jobs_per_page))
-    query = query.replace(" ", "%20")
+    # 2026-05-21: percent-encode the entire query (was only replacing spaces).
+    # Boolean queries like '("RAG" OR "LangChain") AND ("Finance")' need their
+    # double-quotes and parens encoded too -- raw '"' chars break the JS string
+    # that seleniumbase's uc-Chrome wraps the URL in during stealth navigation,
+    # yielding 'javascript error: missing ) after argument list'.
+    query = urllib.parse.quote(query, safe="")
     return (f"https://www.upwork.com/nx/search/jobs/"
             f"?nbs=1"
             f"&page={start_page}"
