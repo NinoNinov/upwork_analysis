@@ -176,26 +176,44 @@ def parse_time(relative_time: str) -> float | None:
     return int(absolute_time.timestamp())
 
 
-def parse_budget(job_type: str, budget: str | None) -> int | None:
+def parse_budget(job_type: str, budget: str | None) -> str | None:
     """
-    Takes the job type (hourly, fixed-price) budget, which might be the budget in $ for a fixed-price
-    job or the estimated time of an hourly job.
-    Returns the hourly rate for hourly jobs and the budget for fixed-price. Returns None if the hourly rate isn't
-    specified.
+    Returns a human-readable budget string preserving range information:
+      - Hourly with range:        '$18-25/hr'
+      - Hourly with single rate:  '$20/hr'
+      - Hourly unspecified:       None
+      - Fixed-price:              '$200'
+      - Unspecified:              None
+
+    2026-05-21: previously returned an int (avg of the hourly range) which threw
+    away both the range and the type signal. The downstream consumer (LLM
+    scoring + email rendering) benefits more from the original phrasing than
+    from a numeric average.
     """
-    job_type = job_type.lower()
-    job_type = job_type.replace("$", "")
-    if "hourly" in job_type:
-        if ":" in job_type:
-            hourly_rate = job_type.split(":")[1]
-            min_rate, max_rate = hourly_rate.split(' - ')
-            average_rate = int((float(max_rate) + float(min_rate)) / 2)
-            return average_rate
-        return None
+    def _trim(num_str: str) -> str:
+        """'18.00' -> '18'; '12.5' -> '12.5'."""
+        try:
+            f = float(num_str.replace(',', ''))
+            return str(int(f)) if f == int(f) else f"{f:g}"
+        except ValueError:
+            return num_str.strip()
+
+    jt_lower = job_type.lower().replace("$", "")
+    if "hourly" in jt_lower:
+        if ":" not in job_type:
+            return None
+        rate_text = job_type.split(":", 1)[1].strip()
+        if ' - ' in rate_text:
+            min_part, max_part = rate_text.split(' - ', 1)
+            min_clean = _trim(min_part.replace('$', '').strip())
+            max_clean = _trim(max_part.replace('$', '').strip())
+            return f"${min_clean}-{max_clean}/hr"
+        rate_clean = _trim(rate_text.replace('$', '').strip())
+        return f"${rate_clean}/hr" if rate_clean else None
     if not budget or '$' not in budget:  # If $ isn't in the budget's text, it means it's "not sure".
         return None
-    budget = budget.replace("$", "").split()[0]  # `split` is the easiest way to git rid of all whitespace.
-    return int(float(budget.replace(',', '')))
+    amount = budget.replace("$", "").split()[0]  # `split` is the easiest way to git rid of all whitespace.
+    return f"${_trim(amount)}"
 
 
 def parse_total_spent(total_spent: str) -> int | None:
